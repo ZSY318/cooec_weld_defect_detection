@@ -1,0 +1,7 @@
+Burn Through-BT
+Contamination-CN
+Lack of Fusion-LOF
+Normal Weld-NW
+Spatter-SR
+Surface Crack-SC
+Undercut-UC

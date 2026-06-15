@@ -1,0 +1,4 @@
+ultralytics>=8.4.61
+# TFLite 导出依赖(导出时 ultralytics 也会自动安装)
+tensorflow
+onnx

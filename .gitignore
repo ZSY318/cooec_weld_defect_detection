@@ -1,0 +1,37 @@
+# Local environments
+.venv/
+__pycache__/
+*.pyc
+
+# Android/Gradle local state and build outputs
+android-app/.gradle/
+android-app/build/
+android-app/app/build/
+android-app/local.properties
+**/build/
+
+# Training datasets and generated training outputs
+training/datasets/
+training/runs/
+training/*.log
+training/*_log.txt
+weldingdataset 3.27/
+video/
+
+# Model training/export intermediates
+*.pt
+*.onnx
+*_saved_model/
+calibration_image_sample_data_*.npy
+calibration_image_sample_data_*.zip
+
+# Root-level screenshots, demo videos, and captured UI dumps
+/*.png
+/test.mp4
+/window.xml
+
+# Local standard-test video asset
+android-app/app/src/main/assets/test.mp4
+
+# Local helper scripts in the project root
+/*.bat

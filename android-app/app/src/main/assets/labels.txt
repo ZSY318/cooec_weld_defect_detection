@@ -1,0 +1,4 @@
+porosity
+crack
+slag
+undercut

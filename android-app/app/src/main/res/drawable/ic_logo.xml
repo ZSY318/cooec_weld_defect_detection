@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 占位 logo:换成你自己的 logo 时,直接替换本文件,
+     或放一张 logo.png 到 drawable 目录并把 activity_home.xml 里
+     imgLogo 的 src 改成 @drawable/logo 即可 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="64dp" android:height="64dp"
+    android:viewportWidth="64" android:viewportHeight="64">
+    <path
+        android:pathData="M10 38 L20 28 L28 36 L36 26 L44 34 L54 24"
+        android:strokeColor="#FF9800"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M10 46 L54 46"
+        android:strokeColor="#8FA1B3"
+        android:strokeWidth="3"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M48 16 l3 6 -6 -1 z"
+        android:fillColor="#FFC107" />
+</vector>

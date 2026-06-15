@@ -1,0 +1,13 @@
+# 焊缝缺陷数据集配置 (YOLO 格式)
+# 把图片放入 datasets/images/{train,val},对应标签 txt 放入 datasets/labels/{train,val}
+
+path: datasets
+train: images/train
+val: images/val
+
+# 按你的实际缺陷类别修改
+names:
+  0: porosity      # 气孔
+  1: crack         # 裂纹
+  2: slag          # 夹渣
+  3: undercut      # 咬边
