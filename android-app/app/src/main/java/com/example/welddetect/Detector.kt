@@ -34,6 +34,18 @@ class Detector(
     private val labels: List<String>
     private val inputSize: Int
 
+    // 逐帧复用的缓冲区,避免每帧重复分配 ~10MB 临时对象造成 GC 卡顿。
+    // 注意:detect() 非线程安全,需保证同一实例串行调用(本工程各页面均在单线程 executor 上调用)。
+    private val outShape: IntArray
+    private val inputBuffer: ByteBuffer
+    private val pixels: IntArray
+    private val letterbox: Bitmap
+    private val letterboxCanvas: Canvas
+    private val output: Array<Array<FloatArray>>
+    private val filterPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val dstRect = RectF()
+    private val padColor = Color.rgb(114, 114, 114)
+
     init {
         interpreter = Interpreter(
             loadModel(context, "models/$modelName.tflite"),
@@ -43,6 +55,15 @@ class Detector(
             .map { it.trim() }.filter { it.isNotEmpty() }
         // 输入形状 [1, H, W, 3]
         inputSize = interpreter.getInputTensor(0).shape()[1]
+
+        outShape = interpreter.getOutputTensor(0).shape()
+        inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
+            .order(ByteOrder.nativeOrder())
+        pixels = IntArray(inputSize * inputSize)
+        letterbox = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+        letterboxCanvas = Canvas(letterbox)
+        // 两种输出格式都是 [1, A, B]:端到端 [1,N,6] 或经典 [1,4+nc,anchors]
+        output = Array(1) { Array(outShape[1]) { FloatArray(outShape[2]) } }
     }
 
     private fun loadModel(context: Context, name: String): ByteBuffer {
@@ -55,25 +76,19 @@ class Detector(
 
     /** 对任意尺寸 Bitmap 推理,返回原图坐标系下的检测结果 */
     fun detect(bitmap: Bitmap): List<Detection> {
-        // letterbox:等比缩放 + 灰边填充,与训练时一致
+        // letterbox:等比缩放 + 灰边填充,与训练时一致。直接在复用画布上缩放绘制,省去 createScaledBitmap。
         val scale = minOf(inputSize.toFloat() / bitmap.width, inputSize.toFloat() / bitmap.height)
         val newW = (bitmap.width * scale).toInt()
         val newH = (bitmap.height * scale).toInt()
         val padX = (inputSize - newW) / 2f
         val padY = (inputSize - newH) / 2f
 
-        val letterboxed = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
-        Canvas(letterboxed).apply {
-            drawColor(Color.rgb(114, 114, 114))
-            drawBitmap(
-                Bitmap.createScaledBitmap(bitmap, newW, newH, true),
-                padX, padY, Paint(Paint.FILTER_BITMAP_FLAG)
-            )
-        }
+        letterboxCanvas.drawColor(padColor)
+        dstRect.set(padX, padY, padX + newW, padY + newH)
+        letterboxCanvas.drawBitmap(bitmap, null, dstRect, filterPaint)
 
-        val input = bitmapToBuffer(letterboxed)
-        val outShape = interpreter.getOutputTensor(0).shape()
-        val raw = parse(input, outShape)
+        fillInputBuffer(letterbox)
+        val raw = parse()
 
         // 把 letterbox 坐标映射回原图
         return raw.mapNotNull { (box, score, cls) ->
@@ -88,37 +103,31 @@ class Detector(
         }
     }
 
-    private fun bitmapToBuffer(bitmap: Bitmap): ByteBuffer {
-        val buffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
-            .order(ByteOrder.nativeOrder())
-        val pixels = IntArray(inputSize * inputSize)
+    /** 把 letterbox 位图写入复用的输入缓冲(归一化 RGB) */
+    private fun fillInputBuffer(bitmap: Bitmap) {
         bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+        inputBuffer.rewind()
         for (p in pixels) {
-            buffer.putFloat(((p shr 16) and 0xFF) / 255f)
-            buffer.putFloat(((p shr 8) and 0xFF) / 255f)
-            buffer.putFloat((p and 0xFF) / 255f)
+            inputBuffer.putFloat(((p shr 16) and 0xFF) / 255f)
+            inputBuffer.putFloat(((p shr 8) and 0xFF) / 255f)
+            inputBuffer.putFloat((p and 0xFF) / 255f)
         }
-        buffer.rewind()
-        return buffer
+        inputBuffer.rewind()
     }
 
-    /** 返回 letterbox 输入坐标系下的 (box, score, classIndex) */
-    private fun parse(input: ByteBuffer, outShape: IntArray): List<Triple<RectF, Float, Int>> {
+    /** 跑一次推理(写入复用的 output),返回 letterbox 输入坐标系下的 (box, score, classIndex) */
+    private fun parse(): List<Triple<RectF, Float, Int>> {
+        interpreter.run(inputBuffer, output)
         return if (outShape.size == 3 && outShape[2] in 5..7) {
-            parseEndToEnd(input, outShape)   // [1, N, 6]
+            decodeEndToEnd()   // [1, N, 6]
         } else {
-            parseRawWithNms(input, outShape) // [1, 4+nc, anchors]
+            decodeRawWithNms() // [1, 4+nc, anchors]
         }
     }
 
-    private fun parseEndToEnd(input: ByteBuffer, outShape: IntArray): List<Triple<RectF, Float, Int>> {
-        val n = outShape[1]
-        val stride = outShape[2]
-        val out = Array(1) { Array(n) { FloatArray(stride) } }
-        interpreter.run(input, out)
-
+    private fun decodeEndToEnd(): List<Triple<RectF, Float, Int>> {
         val results = mutableListOf<Triple<RectF, Float, Int>>()
-        for (row in out[0]) {
+        for (row in output[0]) {
             val score = row[4]
             if (score < confThreshold) continue
             // 坐标可能是归一化(0~1)或像素值,自动判别
@@ -131,12 +140,10 @@ class Detector(
         return results
     }
 
-    private fun parseRawWithNms(input: ByteBuffer, outShape: IntArray): List<Triple<RectF, Float, Int>> {
+    private fun decodeRawWithNms(): List<Triple<RectF, Float, Int>> {
         val channels = outShape[1]   // 4 + 类别数
         val anchors = outShape[2]
-        val out = Array(1) { Array(channels) { FloatArray(anchors) } }
-        interpreter.run(input, out)
-        val o = out[0]
+        val o = output[0]
 
         val candidates = mutableListOf<Triple<RectF, Float, Int>>()
         for (i in 0 until anchors) {

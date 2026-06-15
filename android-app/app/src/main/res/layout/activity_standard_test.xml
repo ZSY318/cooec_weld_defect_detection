@@ -108,15 +108,27 @@
             android:progress="0"
             android:progressTint="@color/accent" />
 
-        <ImageView
-            android:id="@+id/previewImage"
+        <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_marginTop="8dp"
             android:layout_weight="1"
-            android:background="@color/surface_card"
-            android:contentDescription="检测预览"
-            android:scaleType="fitCenter" />
+            android:background="@color/surface_card">
+
+            <ImageView
+                android:id="@+id/previewImage"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="检测进度预览"
+                android:scaleType="fitCenter" />
+
+            <VideoView
+                android:id="@+id/previewVideo"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_gravity="center"
+                android:visibility="gone" />
+        </FrameLayout>
 
         <LinearLayout
             android:id="@+id/playbackControls"
@@ -132,7 +144,7 @@
                 android:layout_height="44dp"
                 android:layout_weight="1"
                 android:backgroundTint="@color/surface_card"
-                android:text="上一帧"
+                android:text="后退3秒"
                 android:textColor="@color/accent" />
 
             <Button
@@ -142,7 +154,7 @@
                 android:layout_marginHorizontal="8dp"
                 android:layout_weight="1"
                 android:backgroundTint="@color/accent"
-                android:text="慢速复看"
+                android:text="播放/暂停"
                 android:textColor="@color/on_accent" />
 
             <Button
@@ -151,9 +163,19 @@
                 android:layout_height="44dp"
                 android:layout_weight="1"
                 android:backgroundTint="@color/surface_card"
-                android:text="下一帧"
+                android:text="前进3秒"
                 android:textColor="@color/accent" />
         </LinearLayout>
+
+        <Button
+            android:id="@+id/btnShareResult"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="8dp"
+            android:backgroundTint="@color/accent"
+            android:text="分享结果（视频/简表/明细）"
+            android:textColor="@color/on_accent"
+            android:textStyle="bold" />
 
         <TextView
             android:id="@+id/summaryText"

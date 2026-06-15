@@ -5,11 +5,11 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.content.Intent
 import android.media.MediaMetadataRetriever
+import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -21,7 +21,10 @@ import android.widget.ProgressBar
 import android.widget.TableLayout
 import android.widget.TableRow
 import android.widget.TextView
+import android.widget.Toast
+import android.widget.VideoView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -38,7 +41,6 @@ class StandardTestActivity : AppCompatActivity() {
         var firstTime: String = "",
         var lastTime: String = "",
     )
-    private data class PreviewFrame(val time: String, val bitmap: Bitmap, val defectCount: Int)
 
     private lateinit var formPanel: LinearLayout
     private lateinit var resultPanel: LinearLayout
@@ -48,32 +50,31 @@ class StandardTestActivity : AppCompatActivity() {
     private lateinit var resultStatusText: TextView
     private lateinit var summaryText: TextView
     private lateinit var previewImage: ImageView
+    private lateinit var previewVideo: VideoView
     private lateinit var progressBar: ProgressBar
     private lateinit var summaryTable: TableLayout
     private lateinit var btnPrevFrame: Button
     private lateinit var btnPlayPause: Button
     private lateinit var btnNextFrame: Button
+    private lateinit var btnShareResult: Button
     private var detector: Detector? = null
     private val executor = Executors.newSingleThreadExecutor()
-    private val playbackHandler = Handler(Looper.getMainLooper())
     private val fileTimeFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-    private val previewFrames = mutableListOf<PreviewFrame>()
-    private var currentPreviewIndex = 0
-    private var isPlaying = false
 
-    private val playbackRunnable = object : Runnable {
-        override fun run() {
-            if (!isPlaying || previewFrames.isEmpty()) return
-            if (currentPreviewIndex < previewFrames.lastIndex) {
-                currentPreviewIndex++
-                showPreviewFrame(currentPreviewIndex)
-                playbackHandler.postDelayed(this, 850L)
-            } else {
-                isPlaying = false
-                btnPlayPause.text = "慢速复看"
-            }
-        }
-    }
+    // 视频按 outputFps 抽帧+编码(回放流畅), 但 YOLO 推理只按 detectFps 跑,
+    // 中间帧复用上一次的检测框 -> 推理次数减到 detectFps/outputFps, 大幅提速
+    private val outputFps = 24
+    private val detectFps = 8
+    // 每个置信缺陷首帧即计入(minHits=1), 仅用中心距离对相邻帧的同一缺陷去重
+    private val stabilizer = DetectionStabilizer(
+        minHits = 1,
+        instantThreshold = 0.45f,
+        maxMisses = 2,
+        displayMisses = 0,
+        matchCenterRatio = 0.8f,
+    )
+    private var resultVideoFile: File? = null
+    private var resultFiles: List<File> = emptyList()
 
     private val palette = intArrayOf(
         Color.rgb(255, 64, 64), Color.rgb(64, 160, 255), Color.rgb(64, 220, 120),
@@ -92,11 +93,13 @@ class StandardTestActivity : AppCompatActivity() {
         resultStatusText = findViewById(R.id.resultStatusText)
         summaryText = findViewById(R.id.summaryText)
         previewImage = findViewById(R.id.previewImage)
+        previewVideo = findViewById(R.id.previewVideo)
         progressBar = findViewById(R.id.progressBar)
         summaryTable = findViewById(R.id.summaryTable)
         btnPrevFrame = findViewById(R.id.btnPrevFrame)
         btnPlayPause = findViewById(R.id.btnPlayPause)
         btnNextFrame = findViewById(R.id.btnNextFrame)
+        btnShareResult = findViewById(R.id.btnShareResult)
 
         val modelName = defaultModelName()
         detector = if (modelName == null) {
@@ -112,20 +115,18 @@ class StandardTestActivity : AppCompatActivity() {
         }
         renderSummaryTable(emptyList())
 
-        findViewById<Button>(R.id.btnRunTest).setOnClickListener {
-            runStandardTest()
-        }
+        findViewById<Button>(R.id.btnRunTest).setOnClickListener { runStandardTest() }
         btnPrevFrame.setOnClickListener {
-            stopPlayback()
-            showPreviewFrame((currentPreviewIndex - 1).coerceAtLeast(0))
+            if (previewVideo.isShown) previewVideo.seekTo((previewVideo.currentPosition - 3000).coerceAtLeast(0))
         }
         btnNextFrame.setOnClickListener {
-            stopPlayback()
-            showPreviewFrame((currentPreviewIndex + 1).coerceAtMost(previewFrames.lastIndex.coerceAtLeast(0)))
+            if (previewVideo.isShown) previewVideo.seekTo(previewVideo.currentPosition + 3000)
         }
         btnPlayPause.setOnClickListener {
-            if (isPlaying) stopPlayback() else startPlayback()
+            if (!previewVideo.isShown) return@setOnClickListener
+            if (previewVideo.isPlaying) previewVideo.pause() else previewVideo.start()
         }
+        btnShareResult.setOnClickListener { shareResults() }
         setPlaybackEnabled(false)
     }
 
@@ -154,18 +155,18 @@ class StandardTestActivity : AppCompatActivity() {
         }
         formPanel.visibility = View.GONE
         resultPanel.visibility = View.VISIBLE
+        previewVideo.stopPlayback()
+        previewVideo.visibility = View.GONE
+        previewImage.visibility = View.VISIBLE
         resultStatusText.text = "后台检测中：准备解析视频..."
         summaryText.text = ""
         progressBar.progress = 0
-        previewFrames.clear()
-        currentPreviewIndex = 0
-        stopPlayback()
+        stabilizer.reset()
         setPlaybackEnabled(false)
         renderSummaryTable(emptyList())
 
         executor.execute {
             val stamp = fileTimeFormat.format(Date())
-            val baseName = stamp
             val summaryCsv = mutableListOf("类别,次数,最高置信度,首次时间,末次时间,是否缺陷")
             val detailCsv = mutableListOf("时间,类别,置信度,左,上,右,下")
             val classSummaries = linkedMapOf<String, ClassSummary>()
@@ -174,6 +175,20 @@ class StandardTestActivity : AppCompatActivity() {
             var totalDefects = 0
             var sampledFrames = 0
 
+            val outDir = File(
+                File(
+                    File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "standard_tests"),
+                    safeName(labelBlock),
+                ),
+                safeName(inspector),
+            )
+            outDir.mkdirs()
+            val summaryFile = File(outDir, "${stamp}_简表.csv")
+            val detailFile = File(outDir, "${stamp}_明细.csv")
+            val previewFile = File(outDir, "${stamp}_预览.jpg")
+            val videoFile = File(outDir, "${stamp}_标注视频.mp4")
+
+            var encoder: FrameVideoEncoder? = null
             try {
                 val retriever = MediaMetadataRetriever()
                 try {
@@ -183,7 +198,10 @@ class StandardTestActivity : AppCompatActivity() {
                     val durationMs = retriever.extractMetadata(
                         MediaMetadataRetriever.METADATA_KEY_DURATION
                     )?.toLongOrNull() ?: 0L
-                    val stepMs = 500L
+                    val stepMs = 1000L / outputFps
+                    val detectStepMs = 1000L / detectFps
+                    var lastDetectMs = -detectStepMs // 保证第 0 帧即检测
+                    var lastDetections: List<Detection> = emptyList()
                     var tMs = 0L
                     while (tMs <= durationMs) {
                         val bitmap = retriever.getFrameAtTime(
@@ -192,46 +210,66 @@ class StandardTestActivity : AppCompatActivity() {
                         )
                         if (bitmap != null) {
                             val scaled = bitmap.scaleForDetection()
-                            val detections = det.detect(scaled)
-                            val annotated = drawResults(scaled, detections)
+                            if (scaled !== bitmap) bitmap.recycle()
                             val timeText = "%.2f".format(Locale.US, tMs / 1000f)
-                            val defectCount = detections.count { it.isDefect() }
 
-                            for (d in detections) {
-                                classSummaries.getOrPut(d.label) { ClassSummary(d.label) }.apply {
-                                    count += 1
-                                    if (d.score > maxScore) maxScore = d.score
-                                    if (firstTime.isEmpty()) firstTime = timeText
-                                    lastTime = timeText
+                            // 按 detectFps 决定本帧是否真正推理;否则复用上一次的框
+                            val doDetect = tMs - lastDetectMs >= detectStepMs
+                            val detections: List<Detection>
+                            if (doDetect) {
+                                val rawDetections = det.detect(scaled)
+                                val stableFrame = stabilizer.update(rawDetections)
+                                detections = stableFrame.detections
+                                lastDetectMs = tMs
+                                lastDetections = detections
+
+                                for (d in stableFrame.newlyConfirmed) {
+                                    classSummaries.getOrPut(d.label) { ClassSummary(d.label) }.apply {
+                                        count += 1
+                                        if (d.score > maxScore) maxScore = d.score
+                                        if (firstTime.isEmpty()) firstTime = timeText
+                                        lastTime = timeText
+                                    }
+                                    detailCsv += listOf(
+                                        timeText,
+                                        csv(LabelDisplay.name(d.label)),
+                                        "%.4f".format(Locale.US, d.score),
+                                        "%.1f".format(Locale.US, d.box.left),
+                                        "%.1f".format(Locale.US, d.box.top),
+                                        "%.1f".format(Locale.US, d.box.right),
+                                        "%.1f".format(Locale.US, d.box.bottom),
+                                    ).joinToString(",")
                                 }
-                                detailCsv += listOf(
-                                    timeText,
-                                    csv(LabelDisplay.name(d.label)),
-                                    "%.4f".format(Locale.US, d.score),
-                                    "%.1f".format(Locale.US, d.box.left),
-                                    "%.1f".format(Locale.US, d.box.top),
-                                    "%.1f".format(Locale.US, d.box.right),
-                                    "%.1f".format(Locale.US, d.box.bottom),
-                                ).joinToString(",")
+                                totalDefects += stableFrame.newlyConfirmed.count { it.isDefect() }
+                            } else {
+                                detections = lastDetections
                             }
 
-                            if (defectCount > bestPreviewDefects) {
+                            val annotated = drawResults(scaled, detections)
+                            if (scaled !== annotated) scaled.recycle()
+                            val defectCount = detections.count { it.isDefect() }
+
+                            if (encoder == null) {
+                                val (w, h) = encodeSize(annotated.width, annotated.height)
+                                encoder = FrameVideoEncoder(w, h, outputFps, videoFile)
+                            }
+                            encoder.encode(annotated)
+
+                            if (doDetect && defectCount > bestPreviewDefects) {
                                 bestPreview = annotated.copy(Bitmap.Config.ARGB_8888, false)
                                 bestPreviewDefects = defectCount
                             }
-                            previewFrames += PreviewFrame(timeText, annotated.copy(Bitmap.Config.ARGB_8888, false), defectCount)
-                            totalDefects += defectCount
+                            annotated.recycle()
                             sampledFrames++
                             val progress = if (durationMs > 0) {
                                 ((tMs * 100) / durationMs).toInt().coerceIn(0, 100)
-                            } else {
-                                0
-                            }
+                            } else 0
 
                             runOnUiThread {
-                                previewImage.setImageBitmap(annotated)
+                                // 处理阶段只更新进度,不逐帧刷预览;完成后再整段播放视频
                                 progressBar.progress = progress
-                                resultStatusText.text = "后台检测中：${progress}% | 当前 ${timeText}s | 检出 ${defectCount} 处缺陷"
+                                resultStatusText.text =
+                                    "后台检测中：${progress}% | ${timeText}s | 当前帧检出 ${defectCount} 处"
                             }
                         }
                         tMs += stepMs
@@ -239,18 +277,8 @@ class StandardTestActivity : AppCompatActivity() {
                 } finally {
                     retriever.release()
                 }
+                encoder?.finish()
 
-                val outDir = File(
-                    File(
-                        File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "standard_tests"),
-                        safeName(labelBlock),
-                    ),
-                    safeName(inspector),
-                )
-                outDir.mkdirs()
-                val summaryFile = File(outDir, "${baseName}_简表.csv")
-                val detailFile = File(outDir, "${baseName}_明细.csv")
-                val previewFile = File(outDir, "${baseName}_预览.jpg")
                 val sortedSummaries = classSummaries.values.sortedWith(
                     compareByDescending<ClassSummary> { it.isDefect() }.thenByDescending { it.count }
                 )
@@ -267,19 +295,23 @@ class StandardTestActivity : AppCompatActivity() {
                 summaryFile.writeText(summaryCsv.joinToString("\n"), Charsets.UTF_8)
                 detailFile.writeText(detailCsv.joinToString("\n"), Charsets.UTF_8)
                 bestPreview?.saveJpeg(previewFile)
+                resultVideoFile = videoFile
+                resultFiles = listOf(videoFile, summaryFile, detailFile, previewFile)
+                    .filter { it.exists() }
 
                 val passed = totalDefects == 0
                 runOnUiThread {
                     progressBar.progress = 100
-                    resultStatusText.text = "识别完成：${if (passed) "通过" else "未通过"} | 抽帧 $sampledFrames | 缺陷 $totalDefects"
+                    resultStatusText.text =
+                        "识别完成：${if (passed) "通过" else "未通过"} | 抽帧 $sampledFrames | 缺陷 $totalDefects"
                     summaryText.text =
-                        "预览：${previewFile.name}\n简表：${summaryFile.name}\n明细：${detailFile.name}"
+                        "标注视频：${videoFile.name}\n简表：${summaryFile.name}\n明细：${detailFile.name}"
                     renderSummaryTable(sortedSummaries)
-                    setPlaybackEnabled(previewFrames.isNotEmpty())
-                    showPreviewFrame(0)
-                    startPlayback()
+                    btnShareResult.isEnabled = resultFiles.isNotEmpty()
+                    startResultVideo(videoFile)
                 }
             } catch (e: Exception) {
+                runCatching { encoder?.finish() }
                 runOnUiThread {
                     resultStatusText.text = "识别失败：${e.message}"
                 }
@@ -287,36 +319,64 @@ class StandardTestActivity : AppCompatActivity() {
         }
     }
 
+    private fun startResultVideo(file: File) {
+        if (!file.exists()) {
+            resultStatusText.text = "${resultStatusText.text}（标注视频生成失败）"
+            return
+        }
+        previewImage.visibility = View.GONE
+        previewVideo.visibility = View.VISIBLE
+        previewVideo.setVideoPath(file.absolutePath)
+        previewVideo.setOnPreparedListener { mp ->
+            mp.isLooping = true
+            previewVideo.start()
+            setPlaybackEnabled(true)
+        }
+        previewVideo.setOnErrorListener { _, what, extra ->
+            resultStatusText.text = "标注视频播放失败（$what/$extra）"
+            true
+        }
+    }
+
     private fun setPlaybackEnabled(enabled: Boolean) {
         btnPrevFrame.isEnabled = enabled
         btnPlayPause.isEnabled = enabled
         btnNextFrame.isEnabled = enabled
+        btnShareResult.isEnabled = enabled
     }
 
-    private fun startPlayback() {
-        if (previewFrames.isEmpty()) return
-        if (currentPreviewIndex >= previewFrames.lastIndex) {
-            currentPreviewIndex = 0
-            showPreviewFrame(currentPreviewIndex)
+    private fun shareResults() {
+        val files = resultFiles.filter { it.exists() }
+        if (files.isEmpty()) {
+            Toast.makeText(this, "暂无可分享的结果文件", Toast.LENGTH_SHORT).show()
+            return
         }
-        isPlaying = true
-        btnPlayPause.text = "暂停"
-        playbackHandler.removeCallbacks(playbackRunnable)
-        playbackHandler.postDelayed(playbackRunnable, 850L)
+        val uris = ArrayList<Uri>(files.map {
+            FileProvider.getUriForFile(this, "${packageName}.fileprovider", it)
+        })
+        val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = "*/*"
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            putExtra(Intent.EXTRA_SUBJECT, "焊缝标准测试结果")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(intent, "分享检测结果"))
     }
 
-    private fun stopPlayback() {
-        isPlaying = false
-        if (::btnPlayPause.isInitialized) btnPlayPause.text = "慢速复看"
-        playbackHandler.removeCallbacks(playbackRunnable)
-    }
-
-    private fun showPreviewFrame(index: Int) {
-        if (previewFrames.isEmpty()) return
-        currentPreviewIndex = index.coerceIn(0, previewFrames.lastIndex)
-        val frame = previewFrames[currentPreviewIndex]
-        previewImage.setImageBitmap(frame.bitmap)
-        resultStatusText.text = "复看 ${frame.time}s | 检出 ${frame.defectCount} 处缺陷 | ${currentPreviewIndex + 1}/${previewFrames.size}"
+    /** 编码尺寸：长边限到 1280 以内并取偶数，兼顾编码速度与编码器能力。 */
+    private fun encodeSize(w: Int, h: Int): Pair<Int, Int> {
+        val maxSide = 1280
+        var ow = w
+        var oh = h
+        val m = maxOf(w, h)
+        if (m > maxSide) {
+            val s = maxSide.toFloat() / m
+            ow = (w * s).toInt()
+            oh = (h * s).toInt()
+        }
+        ow -= ow % 2
+        oh -= oh % 2
+        return ow.coerceAtLeast(2) to oh.coerceAtLeast(2)
     }
 
     private fun Bitmap.scaleForDetection(): Bitmap {
@@ -346,6 +406,7 @@ class StandardTestActivity : AppCompatActivity() {
             val color = palette[d.label.hashCode().mod(palette.size)]
             boxPaint.color = color
             bgPaint.color = color
+            bgPaint.alpha = 140 // 半透明标签底
             canvas.drawRect(d.box, boxPaint)
             val text = "${LabelDisplay.name(d.label)} ${"%.2f".format(Locale.US, d.score)}"
             val tw = textPaint.measureText(text)
@@ -412,7 +473,7 @@ class StandardTestActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopPlayback()
+        runCatching { previewVideo.stopPlayback() }
         executor.shutdown()
         detector?.close()
     }
