@@ -26,8 +26,12 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     private val textBgPaint = Paint().apply { style = Paint.Style.FILL }
 
     private val palette = intArrayOf(
-        Color.rgb(255, 64, 64), Color.rgb(64, 160, 255), Color.rgb(64, 220, 120),
-        Color.rgb(255, 180, 0), Color.rgb(200, 90, 255), Color.rgb(0, 220, 220),
+        Color.rgb(255, 64, 64),
+        Color.rgb(64, 160, 255),
+        Color.rgb(64, 220, 120),
+        Color.rgb(255, 180, 0),
+        Color.rgb(200, 90, 255),
+        Color.rgb(0, 220, 220),
     )
 
     /** @param srcW/srcH 检测所用图像的尺寸,用于把框坐标缩放到本视图 */
@@ -46,6 +50,8 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
         val dy = (height - srcHeight * scale) / 2f
 
         for (d in detections) {
+            if (!shouldDrawDetection(d)) continue
+
             val color = palette[d.label.hashCode().mod(palette.size)]
             boxPaint.color = color
             textBgPaint.color = color
@@ -60,6 +66,15 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
             val tw = textPaint.measureText(text)
             canvas.drawRect(l, t - 52f, l + tw + 16f, t, textBgPaint)
             canvas.drawText(text, l + 8f, t - 12f, textPaint)
+        }
+    }
+
+    private fun shouldDrawDetection(detection: Detection): Boolean {
+        val label = detection.label.lowercase()
+        return when {
+            label.contains("weld") -> detection.score > 0.6f
+            label.contains("spatter") -> detection.score > 0.3f
+            else -> false
         }
     }
 }
